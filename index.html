@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Счётчик стуков</title>
+<style>
+  :root { color-scheme: dark; --bg:#101319; --panel:#1a2029; --muted:#aab4c3; --accent:#69d6b2; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; font:16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:#f4f7fb; display:grid; place-items:center; padding:18px; }
+  main { width:min(100%,560px); background:var(--panel); border:1px solid #303947; border-radius:22px; padding:22px; box-shadow:0 18px 50px #0005; }
+  h1 { margin:0 0 6px; font-size:clamp(25px,6vw,34px); }
+  .sub { margin:0 0 22px; color:var(--muted); }
+  .countbox { background:#11161d; border:1px solid #303947; border-radius:18px; padding:20px; text-align:center; }
+  .count { font-size:clamp(64px,18vw,100px); font-weight:750; line-height:1.05; font-variant-numeric:tabular-nums; }
+  .label { color:var(--muted); margin-top:8px; }
+  .meter { height:14px; background:#0d1117; border-radius:99px; overflow:hidden; margin:20px 0 8px; border:1px solid #303947; }
+  .bar { height:100%; width:0%; background:var(--accent); transition:width 60ms linear; }
+  .meterlabels { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; margin:20px 0; }
+  button { flex:1; min-width:120px; border:0; border-radius:12px; padding:14px 16px; font:inherit; font-weight:650; cursor:pointer; }
+  #start { background:var(--accent); color:#092018; }
+  #stop { background:#313b49; color:#f4f7fb; }
+  #reset { background:#252d38; color:#f4f7fb; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .setting { margin:18px 0; }
+  .settinghead { display:flex; justify-content:space-between; gap:12px; margin-bottom:8px; }
+  .settinghead span:last-child { color:var(--accent); font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .status { padding:12px 14px; background:#11161d; border-radius:12px; color:var(--muted); min-height:44px; }
+  .status.good { color:var(--accent); }
+  .hint { color:var(--muted); font-size:13px; line-height:1.5; margin-top:16px; }
+  .events { margin-top:18px; }
+  .events h2 { font-size:16px; margin:0 0 8px; }
+  ol { margin:0; padding-left:24px; color:var(--muted); max-height:140px; overflow:auto; }
+  .empty { color:#748091; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Счётчик стуков</h1>
+  <p class="sub">Слушает микрофон и считает отдельные резкие звуки.</p>
+  <section class="countbox">
+    <div class="count" id="count">0</div>
+    <div class="label">обнаружено стуков</div>
+    <div class="meter"><div class="bar" id="bar"></div></div>
+    <div class="meterlabels"><span>уровень микрофона</span><span id="level">0%</span></div>
+  </section>
+  <div class="controls">
+    <button id="start">▶ Начать</button>
+    <button id="stop" disabled>■ Остановить</button>
+    <button id="reset">↺ Сброс</button>
+  </div>
+  <div class="setting">
+    <div class="settinghead"><label for="sens">Чувствительность</label><span id="sensval">65%</span></div>
+    <input id="sens" type="range" min="10" max="95" value="65">
+  </div>
+  <div class="setting">
+    <div class="settinghead"><label for="gap">Минимальный интервал между стуками</label><span id="gapval">180 мс</span></div>
+    <input id="gap" type="range" min="80" max="700" step="10" value="180">
+  </div>
+  <div class="status" id="status">Нажми «Начать» и разреши доступ к микрофону.</div>
+  <section class="events">
+    <h2>Последние обнаружения</h2>
+    <ol id="events"><li class="empty">Пока ничего не обнаружено</li></ol>
+  </section>
+  <p class="hint">Обработка выполняется прямо в браузере: звук не записывается и никуда не отправляется. Для доступа к микрофону открой файл в современном браузере; если браузер блокирует микрофон для локального файла, запусти его через localhost или HTTPS.</p>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let ctx = null, stream = null, source = null, analyser = null, raf = 0;
+  let count = 0, lastHit = 0, peak = 0, noiseFloor = 0.008, prevRms = 0;
+  const data = new Float32Array(1024);
+  const startBtn = $('start'), stopBtn = $('stop'), status = $('status');
+
+  function setStatus(msg, good=false) {
+    status.textContent = msg;
+    status.className = 'status' + (good ? ' good' : '');
+  }
+  function updateCount() { $('count').textContent = count; }
+  function addEvent(time) {
+    const list = $('events');
+    if (list.querySelector('.empty')) list.innerHTML = '';
+    const item = document.createElement('li');
+    item.textContent = new Date().toLocaleTimeString() + ' — стук';
+    list.prepend(item);
+    while (list.children.length > 12) list.removeChild(list.lastChild);
+  }
+  function sensitivity() { return Number($('sens').value) / 100; }
+  function minGap() { return Number($('gap').value); }
+
+  function process() {
+    if (!analyser) return;
+    analyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (let i=0; i<data.length; i++) sum += data[i]*data[i];
+    const rms = Math.sqrt(sum/data.length);
+    const level = Math.min(100, Math.round(rms*650));
+    $('bar').style.width = level + '%';
+    $('level').textContent = level + '%';
+
+    // Adaptive noise floor: follows quiet background slowly, but not sharp peaks.
+    if (rms < noiseFloor * 2.5) noiseFloor = noiseFloor * 0.985 + rms * 0.015;
+    const threshold = Math.max(0.012, noiseFloor * (2.4 + (1-sensitivity())*8));
+    const rise = rms - prevRms;
+    const now = performance.now();
+
+    // Count a sudden loud rise, then wait for the chosen lockout interval.
+    if (rms > threshold && rise > Math.max(0.006, threshold*0.22) && now-lastHit > minGap()) {
+      count++;
+      updateCount();
+      lastHit = now;
+      peak = rms;
+      addEvent(now);
+      setStatus('Стук обнаружен! Можно продолжать.', true);
+    }
+    prevRms = rms;
+    raf = requestAnimationFrame(process);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setStatus('Этот браузер не поддерживает доступ к микрофону.');
+        return;
+      }
+      startBtn.disabled = true;
+      setStatus('Запрашиваю доступ к микрофону…');
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+      });
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      await ctx.resume();
+      source = ctx.createMediaStreamSource(stream);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0;
+      source.connect(analyser);
+      noiseFloor = 0.008;
+      prevRms = 0;
+      lastHit = performance.now();
+      stopBtn.disabled = false;
+      setStatus('Микрофон работает. Стучи рядом с ним.', true);
+      process();
+    } catch (e) {
+      startBtn.disabled = false;
+      setStatus(e.name === 'NotAllowedError'
+        ? 'Доступ к микрофону запрещён. Разреши его в настройках браузера.'
+        : 'Не удалось включить микрофон: ' + (e.message || e));
+    }
+  });
+
+  function stop() {
+    cancelAnimationFrame(raf);
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (ctx) ctx.close();
+    stream = ctx = source = analyser = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    $('bar').style.width = '0%';
+    $('level').textContent = '0%';
+    setStatus('Остановлено. Нажми «Начать», чтобы продолжить.');
+  }
+  stopBtn.addEventListener('click', stop);
+  $('reset').addEventListener('click', () => {
+    count = 0; updateCount(); $('events').innerHTML = '<li class="empty">Пока ничего не обнаружено</li>';
+    setStatus('Счётчик сброшен. ' + (analyser ? 'Микрофон продолжает работать.' : 'Нажми «Начать».'));
+  });
+  $('sens').addEventListener('input', () => $('sensval').textContent = $('sens').value + '%');
+  $('gap').addEventListener('input', () => $('gapval').textContent = $('gap').value + ' мс');
+  window.addEventListener('pagehide', stop);
+})();
+</script>
+</body>
+</html>
